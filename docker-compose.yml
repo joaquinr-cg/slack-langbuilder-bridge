@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  slack-langflow-bridge:
+    build: .
+    container_name: slack-langflow-bridge
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data  # Persist SQLite database
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
