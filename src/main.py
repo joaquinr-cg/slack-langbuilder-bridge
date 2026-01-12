@@ -18,14 +18,16 @@ from typing import Optional
 
 from .config import get_settings, setup_logging
 from .session_manager import SessionManager
-from .langflow_client import LangflowClient
+from .flow_manager import FlowManager
+from .langflow_client import LangflowClientManager
 from .slack_handler import SlackHandler
 
 logger = logging.getLogger(__name__)
 
-# Global reference for cleanup
+# Global references for cleanup
 _handler: Optional[SlackHandler] = None
 _session_manager: Optional[SessionManager] = None
+_flow_manager: Optional[FlowManager] = None
 _cleanup_task: Optional[asyncio.Task] = None
 
 
@@ -54,9 +56,41 @@ async def periodic_cleanup(
             logger.error("Error during periodic cleanup: %s", e)
 
 
+async def setup_default_flow(settings, flow_manager: FlowManager) -> None:
+    """
+    Set up default flow from environment variables if provided.
+
+    This provides backward compatibility with the single-flow configuration.
+
+    Args:
+        settings: Application settings.
+        flow_manager: Flow manager instance.
+    """
+    if not settings.has_default_flow_config:
+        logger.info("No default flow configured via environment variables")
+        return
+
+    # Check if flow already exists
+    existing = await flow_manager.get_flow(settings.default_flow_name)
+    if existing:
+        logger.info("Default flow '%s' already exists in database", settings.default_flow_name)
+        return
+
+    # Create the default flow from env vars
+    await flow_manager.add_flow(
+        name=settings.default_flow_name,
+        langflow_url=settings.langflow_api_url,
+        flow_id=settings.langflow_flow_id,
+        api_key=settings.langflow_api_key,
+        description="Default flow configured via environment variables",
+        is_default=True,
+    )
+    logger.info("Created default flow '%s' from environment variables", settings.default_flow_name)
+
+
 async def main() -> None:
     """Main entry point for the bot."""
-    global _handler, _session_manager, _cleanup_task
+    global _handler, _session_manager, _flow_manager, _cleanup_task
 
     # Load settings
     try:
@@ -73,21 +107,28 @@ async def main() -> None:
     # Ensure data directory exists
     settings.ensure_data_directory()
 
-    # Initialize components
+    # Initialize session manager
     _session_manager = SessionManager(settings.database_path)
     await _session_manager.initialize()
 
-    langflow_client = LangflowClient(
-        api_url=settings.langflow_api_url,
-        flow_id=settings.langflow_flow_id,
-        api_key=settings.langflow_api_key,
+    # Initialize flow manager
+    _flow_manager = FlowManager(settings.database_path)
+    await _flow_manager.initialize()
+
+    # Set up default flow from env vars if provided
+    await setup_default_flow(settings, _flow_manager)
+
+    # Initialize client manager
+    client_manager = LangflowClientManager(
         timeout=settings.request_timeout,
     )
 
+    # Initialize Slack handler
     _handler = SlackHandler(
         settings=settings,
         session_manager=_session_manager,
-        langflow_client=langflow_client,
+        flow_manager=_flow_manager,
+        client_manager=client_manager,
     )
 
     # Start periodic cleanup task
@@ -101,11 +142,20 @@ async def main() -> None:
 
     # Log configuration (without sensitive values)
     logger.info("Configuration:")
-    logger.info("  - Langflow URL: %s", settings.langflow_api_url)
-    logger.info("  - Flow ID: %s", settings.langflow_flow_id)
     logger.info("  - Database: %s", settings.database_path)
     logger.info("  - Request timeout: %d seconds", settings.request_timeout)
     logger.info("  - Session TTL: %d hours", settings.session_ttl_hours)
+    if settings.admin_users:
+        logger.info("  - Admin users: %d configured", len(settings.admin_users))
+    else:
+        logger.info("  - Admin users: all users (no restriction)")
+
+    # Log flow stats
+    flows = await _flow_manager.list_flows()
+    logger.info("Flows configured: %d", len(flows))
+    for flow in flows:
+        default_marker = " (default)" if flow.is_default else ""
+        logger.info("  - %s%s: %s", flow.name, default_marker, flow.langflow_url)
 
     # Log session stats
     stats = await _session_manager.get_session_stats()

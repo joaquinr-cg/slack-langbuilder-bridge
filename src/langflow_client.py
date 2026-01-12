@@ -5,15 +5,21 @@ Handles communication with Langflow's run endpoint, including:
 - Long timeouts for agent processing
 - Retry logic with exponential backoff for 5xx errors
 - Proper error handling and logging
+- Multi-flow support via LangflowClientManager
 """
+
+from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
 
 import httpx
 
 from .response_parser import extract_message
+
+if TYPE_CHECKING:
+    from .flow_manager import FlowConfig
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +72,29 @@ class LangflowClient:
         self.timeout = timeout
         self.max_retries = max_retries
         self._client: Optional[httpx.AsyncClient] = None
+
+    @classmethod
+    def from_flow_config(
+        cls, config: FlowConfig, timeout: int = 300, max_retries: int = 2
+    ) -> LangflowClient:
+        """
+        Create a client from a FlowConfig object.
+
+        Args:
+            config: FlowConfig containing connection details.
+            timeout: Request timeout in seconds.
+            max_retries: Maximum number of retries.
+
+        Returns:
+            Configured LangflowClient instance.
+        """
+        return cls(
+            api_url=config.langflow_url,
+            flow_id=config.flow_id,
+            api_key=config.api_key,
+            timeout=timeout,
+            max_retries=max_retries,
+        )
 
     @property
     def endpoint(self) -> str:
@@ -207,3 +236,60 @@ class LangflowClient:
         """
         response = await self.run_flow(message, session_id)
         return extract_message(response)
+
+
+class LangflowClientManager:
+    """
+    Manages multiple Langflow clients for different flows.
+
+    Caches clients to avoid creating new connections for each request.
+    """
+
+    def __init__(self, timeout: int = 300, max_retries: int = 2):
+        """
+        Initialize the client manager.
+
+        Args:
+            timeout: Default timeout for all clients.
+            max_retries: Default max retries for all clients.
+        """
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self._clients: dict[str, LangflowClient] = {}
+
+    def get_client(self, config: FlowConfig) -> LangflowClient:
+        """
+        Get or create a client for a flow configuration.
+
+        Args:
+            config: FlowConfig for the desired flow.
+
+        Returns:
+            LangflowClient instance.
+        """
+        # Use flow name as cache key
+        if config.name not in self._clients:
+            self._clients[config.name] = LangflowClient.from_flow_config(
+                config, self.timeout, self.max_retries
+            )
+            logger.debug("Created new client for flow: %s", config.name)
+        return self._clients[config.name]
+
+    def invalidate(self, flow_name: str) -> None:
+        """
+        Invalidate a cached client (e.g., after flow config update).
+
+        Args:
+            flow_name: Name of the flow to invalidate.
+        """
+        if flow_name in self._clients:
+            # Don't await close here - let it be garbage collected
+            del self._clients[flow_name]
+            logger.debug("Invalidated client cache for flow: %s", flow_name)
+
+    async def close_all(self) -> None:
+        """Close all cached clients."""
+        for name, client in self._clients.items():
+            await client.close()
+            logger.debug("Closed client for flow: %s", name)
+        self._clients.clear()
