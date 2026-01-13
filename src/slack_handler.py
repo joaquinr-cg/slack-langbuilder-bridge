@@ -21,6 +21,7 @@ import asyncio
 import logging
 import re
 import shlex
+import time
 from typing import Optional, Set
 
 from slack_bolt.async_app import AsyncApp
@@ -72,6 +73,10 @@ class SlackHandler:
         self._bot_threads: Set[str] = set()
         # Track messages currently being processed to avoid duplicates
         self._processing: Set[str] = set()
+        # Track recently processed messages (message_key -> timestamp)
+        self._processed_messages: dict[str, float] = {}
+        # How long to remember processed messages (in seconds)
+        self._dedup_window: int = 60
 
         # Initialize Slack app
         self.app = AsyncApp(token=settings.slack_bot_token)
@@ -126,6 +131,13 @@ class SlackHandler:
         """Check if the message is an admin command."""
         return bool(self.COMMAND_PATTERN.match(text.strip()))
 
+    def _cleanup_processed_messages(self, current_time: float) -> None:
+        """Remove old entries from the processed messages dict."""
+        cutoff = current_time - self._dedup_window
+        expired = [k for k, v in self._processed_messages.items() if v < cutoff]
+        for k in expired:
+            del self._processed_messages[k]
+
     async def _handle_message(
         self,
         event: dict,
@@ -154,6 +166,16 @@ class SlackHandler:
         if message_key in self._processing:
             logger.debug("Already processing message %s", message_key)
             return
+
+        # Skip if recently processed (deduplication for Slack retries)
+        current_time = time.time()
+        if message_key in self._processed_messages:
+            if current_time - self._processed_messages[message_key] < self._dedup_window:
+                logger.debug("Skipping duplicate message %s", message_key)
+                return
+
+        # Cleanup old entries from processed messages dict
+        self._cleanup_processed_messages(current_time)
 
         # Get bot user ID
         bot_user_id = await self._get_bot_user_id(client)
@@ -317,6 +339,8 @@ class SlackHandler:
         finally:
             # Remove from processing set
             self._processing.discard(message_key)
+            # Mark as processed for deduplication
+            self._processed_messages[message_key] = time.time()
 
     async def _handle_command(
         self,
